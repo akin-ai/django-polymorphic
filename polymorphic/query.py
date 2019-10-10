@@ -19,11 +19,6 @@ from .query_translate import (
     translate_polymorphic_Q_object,
 )
 
-# chunk-size: maximum number of objects requested per db-request
-# by the polymorphic queryset.iterator() implementation
-Polymorphic_QuerySet_objects_per_request = 100
-
-
 class PolymorphicModelIterable(ModelIterable):
     """
     ModelIterable for PolymorphicModel
@@ -44,33 +39,26 @@ class PolymorphicModelIterable(ModelIterable):
 
             real_results = queryset._get_real_instances(list(base_iter))
             for o in real_results: yield o
-
-        but it requests the objects in chunks from the database,
-        with Polymorphic_QuerySet_objects_per_request per chunk
         """
+        base_result_objects = []
         while True:
-            base_result_objects = []
-            reached_end = False
 
-            # Make sure the base iterator is read in chunks instead of
-            # reading it completely, in case our caller read only a few objects.
-            for i in range(Polymorphic_QuerySet_objects_per_request):
+            try:
+                # obj = next(base_iter)
+                # obj_cls_id = obj.polymorphic_ctype_id
+                # if obj_cls_id not in base_result_objects:
+                #     base_result_objects[obj_cls_id] = []
+                # base_result_objects[obj_cls_id].append(obj)
+                base_result_objects.append(next(base_iter))
+            except StopIteration:
+                break
 
-                try:
-                    o = next(base_iter)
-                    base_result_objects.append(o)
-                except StopIteration:
-                    reached_end = True
-                    break
+        # real_results = []
+        # for cls_id, obj_list in base_result_objects.items():
+        #     real_results.extend(self.queryset._get_real_instances(obj_list))
 
-            real_results = self.queryset._get_real_instances(base_result_objects)
-
-            for o in real_results:
-                yield o
-
-            if reached_end:
-                return
-
+        for o in self.queryset._get_real_instances(base_result_objects):
+            yield o
 
 def transmogrify(cls, obj):
     """
@@ -114,6 +102,9 @@ class PolymorphicQuerySet(QuerySet):
         # to that queryset as well).
         self.polymorphic_deferred_loading = (set([]), True)
 
+        # Prefetch for polymorphic objects
+        self.polyprefetch_fields = {}
+
     def _clone(self, *args, **kwargs):
         # Django's _clone only copies its own variables, so we need to copy ours here
         new = super(PolymorphicQuerySet, self)._clone(*args, **kwargs)
@@ -122,6 +113,7 @@ class PolymorphicQuerySet(QuerySet):
             copy.copy(self.polymorphic_deferred_loading[0]),
             self.polymorphic_deferred_loading[1],
         )
+        new.polyprefetch_fields = copy.copy(self.polyprefetch_fields)
         return new
 
     def as_manager(cls):
@@ -159,6 +151,15 @@ class PolymorphicQuerySet(QuerySet):
         """Filter the queryset to exclude the classes in args (and their subclasses)."""
         # Implementation in _translate_polymorphic_filter_defnition."""
         return self.filter(not_instance_of=args)
+
+    def polyprefetch(self, cls, field_names):
+        """
+        Add prefetch_related() support for inherited classes.
+        """
+        if cls not in self.polyprefetch_fields:
+            self.polyprefetch_fields[cls] = []
+        self.polyprefetch_fields[cls] = field_names
+        return self
 
     def _filter_or_exclude(self, negate, *args, **kwargs):
         # We override this internal Django functon as it is used for all filter member functions.
@@ -308,12 +309,6 @@ class PolymorphicQuerySet(QuerySet):
         clone.polymorphic_disabled = True
         return clone
 
-    # Since django_polymorphic 'V1.0 beta2', extra() always returns polymorphic results.
-    # The resulting objects are required to have a unique primary key within the result set
-    # (otherwise an error is thrown).
-    # The "polymorphic" keyword argument is not supported anymore.
-    # def extra(self, *args, **kwargs):
-
     def _get_real_instances(self, base_result_objects):
         """
         Polymorphic object loader
@@ -406,9 +401,14 @@ class PolymorphicQuerySet(QuerySet):
         # TODO: defer(), only(): support for these would be around here
         for real_concrete_class, idlist in idlist_per_model.items():
             indices = indexlist_per_model[real_concrete_class]
+
             real_objects = real_concrete_class._base_objects.db_manager(self.db).filter(
-                **{("%s__in" % pk_name): idlist}
-            )
+                    **{("%s__in" % pk_name): idlist}
+                )
+
+            if real_concrete_class in self.polyprefetch_fields:
+                real_objects = real_objects.prefetch_related(*self.polyprefetch_fields[real_concrete_class])
+
             # copy select related configuration to new qs
             real_objects.query.select_related = self.query.select_related
 
